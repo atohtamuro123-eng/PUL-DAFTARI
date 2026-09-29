@@ -22,18 +22,20 @@ import hashlib
 import hmac
 import json
 import os
-import sqlite3
 import time
 from contextlib import contextmanager
 from urllib.parse import parse_qsl
 
 import httpx
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-DB_PATH = os.environ.get("DB_PATH", "pul_daftari.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID", "")  # bo'sh bo'lsa - hammaga ochiq
 INIT_DATA_MAX_AGE = 24 * 60 * 60  # 24 soat
 
 app = FastAPI()
@@ -42,8 +44,9 @@ app = FastAPI()
 # ---------------------------------------------------------------- storage --
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL sozlanmagan — Postgres ulang.")
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
     try:
         yield conn
         conn.commit()
@@ -53,12 +56,13 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS users (
-                user_id TEXT PRIMARY KEY,
-                data TEXT NOT NULL
-            )"""
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS users (
+                    user_id TEXT PRIMARY KEY,
+                    data JSONB NOT NULL
+                )"""
+            )
 
 
 init_db()
@@ -66,21 +70,22 @@ init_db()
 
 def load_user(user_id: str) -> dict:
     with get_db() as conn:
-        row = conn.execute(
-            "SELECT data FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT data FROM users WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
     if row:
-        return json.loads(row["data"])
+        return row["data"]
     return {"transactions": [], "autoNotify": False}
 
 
 def save_user(user_id: str, data: dict):
     with get_db() as conn:
-        conn.execute(
-            "INSERT INTO users (user_id, data) VALUES (?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET data = excluded.data",
-            (user_id, json.dumps(data)),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (user_id, data) VALUES (%s, %s) "
+                "ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data",
+                (user_id, json.dumps(data)),
+            )
 
 
 # ------------------------------------------------------- telegram auth -----
@@ -114,6 +119,9 @@ def validate_init_data(init_data: str) -> dict:
     user = json.loads(parsed.get("user", "{}"))
     if "id" not in user:
         raise HTTPException(401, "Foydalanuvchi aniqlanmadi")
+
+    if ALLOWED_USER_ID and str(user["id"]) != str(ALLOWED_USER_ID):
+        raise HTTPException(403, "Bu bot faqat egasi uchun ochiq")
 
     return user
 
